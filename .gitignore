@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+verification.json
+connection-verification.json
+run.local.sh
+.env.*
+!.env.example
+*.log
