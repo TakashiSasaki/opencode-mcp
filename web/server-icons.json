@@ -1,0 +1,16 @@
+[
+  {
+    "src": "https://opencode.moukaeritai.work/icons/icon-512.png?v=ff3577823e7f",
+    "mimeType": "image/png",
+    "sizes": [
+      "512x512"
+    ]
+  },
+  {
+    "src": "https://opencode.moukaeritai.work/favicon.svg?v=ff3577823e7f",
+    "mimeType": "image/svg+xml",
+    "sizes": [
+      "any"
+    ]
+  }
+]

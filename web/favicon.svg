@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="opencode-mcp-title opencode-mcp-desc">
+<!-- Copyright (c) 2026 佐々木隆志 (Takashi Sasaki) <takashi316@gmail.com> (https://x.com/TakashiSasaki) -->
+<title id="opencode-mcp-title">OpenCode MCP</title>
+<desc id="opencode-mcp-desc">コーディングを動かす、プロンプトとカーソル。</desc>
+<defs>
+  <linearGradient id="opencode-mcp-bg" x1="0" y1="0" x2="1" y2="1">
+    <stop stop-color="#174D85"/><stop offset="1" stop-color="#112D55"/>
+  </linearGradient>
+  <radialGradient id="opencode-mcp-light" cx=".2" cy="0" r="1">
+    <stop stop-color="#82C6FF" stop-opacity=".14"/><stop offset="1" stop-color="#82C6FF" stop-opacity="0"/>
+  </radialGradient>
+</defs>
+<rect width="256" height="256" rx="59" fill="url(#opencode-mcp-bg)"/>
+<rect width="256" height="256" rx="59" fill="url(#opencode-mcp-light)"/>
+<rect x="1" y="1" width="254" height="254" rx="58" fill="none" stroke="#FFFFFF" stroke-opacity=".12" stroke-width="2"/>
+<rect x="51" y="63" width="154" height="130" rx="20" fill="none" stroke="#F6FAFF" stroke-width="15"/><path d="M82 105L108 128L82 151" fill="none" stroke="#82C6FF" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/><path d="M133 153H172" fill="none" stroke="#F6FAFF" stroke-width="15" stroke-linecap="round"/>
+</svg>

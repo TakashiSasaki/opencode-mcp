@@ -91,3 +91,16 @@ uv run --locked python verify_mcp.py
 - [OpenCode V2 API](https://dev.opencode.ai/v2/docs/api)
 - [OpenCode V2 OpenAPI](https://dev.opencode.ai/v2/openapi.json)
 - [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+
+## Service icon
+
+The original artwork is `web/favicon.svg`; PNG and maskable exports are in
+`web/icons/`, with a real multi-size `web/favicon.ico` for legacy browsers.
+`web/server-icons.json` contains the public MCP implementation icon metadata,
+with PNG first and SVG as a scalable alternative. Keep its version queries in
+sync with changes to the artwork. The icon images are public static assets;
+MCP and application access policies are configured separately.
+
+`deploy/icons.caddy` provides the `opencode_mcp_icons` snippet. Import its
+file and then invoke the snippet with the absolute `web/` directory inside the
+existing site block. Preserve the existing MCP and application access rules.

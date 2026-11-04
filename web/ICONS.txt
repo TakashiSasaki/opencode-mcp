@@ -1,0 +1,11 @@
+OpenCode MCP icon assets
+
+The editable original is favicon.svg; raster exports use the same artwork.
+The square full-background maskable original is icons/maskable.svg.
+server-icons.json is the MCP Implementation icons array, PNG first, then SVG.
+Public deployment: https://opencode.moukaeritai.work/
+Update the version query in server-icons.json and the page when changing artwork.
+Serve the favicon, icons and server-icons.json as public static assets.
+Access controls for MCP, health endpoints and application pages remain separate.
+
+Copyright (c) 2026 佐々木隆志 (Takashi Sasaki) <takashi316@gmail.com> (https://x.com/TakashiSasaki)

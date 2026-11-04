@@ -14,7 +14,7 @@ from urllib.parse import quote, urlencode
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import Icon, ToolAnnotations
 from pydantic import Field
 
 
@@ -37,6 +37,8 @@ WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_
 mcp = MCPServer(
     name="opencode",
     version=VERSION,
+    icons=[Icon.model_validate(icon) for icon in json.loads(
+        (PROJECT / "web" / "server-icons.json").read_text())],
     instructions=(
         "Delegate coding tasks to the OpenCode agent on the user's host. "
         "Call opencode_info and opencode_models to discover settings. "
