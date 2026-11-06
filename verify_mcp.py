@@ -74,6 +74,14 @@ async def verify(url: str | None, inference: bool, model: str | None = None) -> 
             finally:
                 # This fresh, uniquely named session never received a model prompt.
                 await server.api("delete", f"/api/session/{session_id}")
+                # OpenCode retains loaded location services after session deletion.
+                # Evict while the directories still exist, otherwise a later
+                # configuration reload tries to load a deleted temporary path.
+                for path in (first, second):
+                    await server.api("delete", "/api/debug/location", **{"location[directory]": str(path)})
+                loaded = await server.api("get", "/api/debug/location")
+                assert not {str(first), str(second)} & {item["directory"] for item in loaded}
+                results["temporary_locations_evicted"] = True
 
         if inference:
             selected = model or info["default_model"]
