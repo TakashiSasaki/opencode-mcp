@@ -13,6 +13,7 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 import tomllib
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlencode
@@ -24,6 +25,7 @@ from mcp.types import Icon, ToolAnnotations
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse
 
+from availability import ModelListResult, ModelObservation, ObservationScan, OBSERVATION_NOTE, UsageResult, iso_time, merge_observations
 
 PROJECT = Path(__file__).resolve().parent
 DEFAULT_DIRECTORY = Path(os.getenv("OPENCODE_MCP_DIRECTORY", str(PROJECT.parent))).resolve()
@@ -53,6 +55,7 @@ ROOTS = tuple(
 DEFAULT_MODEL = os.getenv("OPENCODE_MCP_MODEL", "opencode/big-pickle")
 CLI = os.getenv("OPENCODE_MCP_CLI") or shutil.which("opencode") or "opencode"
 PUBLIC_URL = os.getenv("OPENCODE_MCP_PUBLIC_URL", "")
+HISTORY_TIMEOUT_SECONDS = 8
 
 READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True)
@@ -68,6 +71,8 @@ SERVER_INSTRUCTIONS = (
         "OpenCode permissions still apply. opencode_info(tool='opencode_start_task', include_instructions=true) "
         "returns the native tool definition and full instructions. "
         "Call opencode_info and opencode_models to discover settings. "
+        "opencode_models and opencode_usage include observed provider limits and retry estimates from recent sessions; "
+        "zero catalog pricing does not establish remaining quota. "
         "Use opencode_workspaces to list known working directories, opencode_projects to list projects, "
         "and opencode_workspace to resolve a specific directory. Select directory_path when starting a task. "
         "A directory may belong to a project root or a saved Git worktree; loaded means currently cached by the server. "
@@ -211,7 +216,49 @@ def model_summary(model: dict[str, Any]) -> dict[str, Any]:
     result["cost_unit"] = "USD per million tokens"
     result["free_by_catalog"] = {"zero_catalog_price": True, "paid": False}.get(result["pricing_status"])
     result["quota_available"] = "unknown"
+    result["last_observation"] = None
     return result
+
+
+async def recent_model_observations(path: Path, session_limit: int) -> tuple[dict[str, ModelObservation], ObservationScan]:
+    """Bounded reads from OpenCode's durable history, shared by stdio and HTTP."""
+    now_ms = time.time_ns() // 1_000_000
+    observations: dict[str, ModelObservation] = {}
+    scan: ObservationScan = {"checked_at": iso_time(now_ms), "source": "recent_session_messages",
+                            "directory": str(path), "session_limit": session_limit, "sessions_examined": 0,
+                            "sessions_truncated": False, "messages_per_session": 5, "partial": False, "issues": []}
+
+    def issue(code: str) -> None:
+        scan["partial"] = True
+        if code not in scan["issues"]:
+            scan["issues"].append(code)
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def inspect_session(info: dict[str, Any]) -> None:
+        try:
+            # Do not trust an unexpected inventory entry to broaden the query scope.
+            if directory(info["location"]["directory"]) != path:
+                return
+            sid = identifier(info["id"], "ses_")
+            async with semaphore:
+                response = await api("get", f"/api/session/{sid}/message", limit=5, order="desc")
+            merge_observations(observations, response["data"], info["id"], now_ms)
+            scan["sessions_examined"] += 1
+        except (APIError, InputError, OSError, KeyError, TypeError, ValueError):
+            issue("session_result_unavailable")
+
+    try:
+        # A slow history route must not prevent callers from reading the model catalog.
+        async with asyncio.timeout(HISTORY_TIMEOUT_SECONDS):
+            response = await api("get", "/api/session", directory=str(path), limit=session_limit)
+            scan["sessions_truncated"] = bool((response.get("cursor") or {}).get("next"))
+            await asyncio.gather(*(inspect_session(info) for info in response["data"][:session_limit]))
+    except TimeoutError:
+        issue("history_timeout")
+    except (APIError, OSError, KeyError, TypeError, ValueError):
+        issue("session_inventory_unavailable")
+    return observations, scan
 
 
 def zero_token_price(model: dict[str, Any]) -> bool:
@@ -467,36 +514,60 @@ async def opencode_models(
     provider: Annotated[str | None, Field(description="Exact provider ID, for example opencode; omit for all enabled providers")] = None,
     directory_path: OptionalWorkspaceDirectory = None,
     free_only: Annotated[bool, Field(description="Only models with zero catalog token prices; does not confirm remaining quota; default false")] = False,
-) -> dict[str, Any]:
+    include_recent_results: Annotated[bool, Field(description="Include observed success/errors and retry estimates from recent session history without inference; default true")] = True,
+    session_limit: Annotated[int, Field(ge=1, le=50, description="Maximum recent sessions to inspect in this workspace, 1–50; default 20; only used with include_recent_results")] = 20,
+) -> ModelListResult:
     """List enabled models, free/paid/unknown pricing, and supported reasoning_efforts.
 
     Set free_only=true for models whose listed input/output/cache token prices are all zero across every price tier.
     free_by_catalog identifies catalog pricing, not remaining account quota. No inference request is sent.
     An empty reasoning_efforts list means the model does not expose a selectable effort through OpenCode.
+    last_observation reports a past provider response, including quota_exhausted/rate_limited and retry_at.
+    null means no result was found in the sampled history. retry_due is not proof of restored quota.
+    Inspect observation_scan for scope/truncation/partial errors; set include_recent_results=false for catalog only.
     """
-    models = await model_catalog(directory(directory_path))
+    path = directory(directory_path)
+    models = await model_catalog(path)
     selected = [model_summary(m) for m in models if m.get("enabled") and (provider is None or m.get("providerID") == provider)
                 and (not free_only or zero_token_price(m))]
+    observations, scan = await recent_model_observations(path, session_limit) if include_recent_results else ({}, None)
+    for item in selected:
+        item["last_observation"] = observations.get(item["model"])
     return {"models": selected, "count": len(selected), "free_only": free_only,
+            "observation_scan": scan, "availability_note": OBSERVATION_NOTE,
             "pricing_note": "Catalog rates only. Free promotions and quotas can change. Zero pricing does not guarantee remaining free quota; providers can return HTTP 429. See opencode_usage for available account allowance data."}
 
 
 @mcp.tool(annotations=READ)
-async def opencode_usage(directory_path: OptionalWorkspaceDirectory = None) -> dict[str, Any]:
+async def opencode_usage(
+    directory_path: OptionalWorkspaceDirectory = None,
+    include_recent_results: Annotated[bool, Field(description="Include observed provider outcomes and retry estimates from recent sessions; default true; sends no model prompts")] = True,
+    session_limit: Annotated[int, Field(ge=1, le=50, description="Maximum recent sessions to inspect in this workspace, 1–50; default 20")] = 20,
+) -> UsageResult:
     """Get the signed-in OpenCode Console workspace's Go allowance and Console budgets, if supported.
 
     This endpoint does not guarantee remaining free promotional-model quota or other providers' account balances.
+    supported describes API support; limits_available separately states whether actual account data was returned.
+    model_observations contains observed provider failures/successes, not remaining requests or tokens.
     """
     path = directory(directory_path)
+    reason = None
     try:
         result = await api("get", "/api/experimental/usage/limits", **{"location[directory]": str(path)})
     except APIError as exc:
         if exc.status_code != 404:
             raise
-        return {"supported": False, "limits": None,
-                "reason": "The running OpenCode version does not provide the documented experimental usage-limits endpoint.",
-                "free_promotional_model_quota": "unknown"}
-    return {"supported": True, "limits": result["data"], "free_promotional_model_quota": "not provided by this endpoint"}
+        result = {"data": None}
+        reason = "The running OpenCode version does not provide the documented experimental usage-limits endpoint."
+    observations, scan = await recent_model_observations(path, session_limit) if include_recent_results else ({}, None)
+    response: UsageResult = {"supported": reason is None, "limits": result["data"],
+                             "limits_available": result["data"] is not None,
+                             "free_promotional_model_quota": "unknown",
+                             "model_observations": sorted(observations.values(), key=lambda item: item["model"]),
+                             "observation_scan": scan, "availability_note": OBSERVATION_NOTE}
+    if reason:
+        response["reason"] = reason
+    return response
 
 
 @mcp.tool(annotations=READ)
@@ -617,12 +688,15 @@ async def opencode_get_task(
         api("get", f"/api/session/{session_id}/message", limit=message_limit, **({"cursor": cursor} if cursor else {"order": "desc"})),
     )
     info = await checked_session(session_id)
+    observations: dict[str, ModelObservation] = {}
+    merge_observations(observations, messages["data"], session_id, time.time_ns() // 1_000_000)
     return {
         "session": session_summary(info),
         "status": execution_status(info, session_id in active["data"], inbox["data"], permissions["data"], forms["data"]),
         "queued_inputs": [{"id": item["id"], "type": item.get("type"), "delivery": item.get("delivery")} for item in inbox["data"]],
         "pending_permissions": permissions["data"], "pending_forms": forms["data"],
         "messages": [summarize_message(message, max_text_chars) for message in messages["data"]],
+        "page_model_observations": sorted(observations.values(), key=lambda item: item["model"]),
         "cursor": messages.get("cursor"),
         "cost_note": "Recorded local session cost in USD; not a provider billing statement.",
     }

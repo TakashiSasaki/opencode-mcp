@@ -52,8 +52,8 @@ MCPのパスは `/mcp`、プロセスのヘルスチェックは `/healthz` で�
 | `opencode_projects` | 登録済みプロジェクトの一覧。プロジェクトID・代表ディレクトリを取得 |
 | `opencode_workspaces` | 既知の作業場所の一覧。プロジェクトの代表パス・Git worktree・読み込み中の場所を統合 |
 | `opencode_workspace` | 指定したディレクトリと、その所属プロジェクト・プロジェクトの代表パスを確認 |
-| `opencode_models` | 有効なモデル、料金区分、指定可能な思考強度の取得。`free_only: true` で無料料金だけに絞り込む |
-| `opencode_usage` | OpenCode Consoleの利用枠取得。稼働バージョンで非対応ならその旨を返す |
+| `opencode_models` | 有効なモデル、料金区分、思考強度、直近の実行結果・無料枠エラー・再試行目安。`free_only: true` で無料料金だけに絞り込む |
+| `opencode_usage` | OpenCode Consoleの利用枠データの有無と、最近のモデル実行結果。API非対応とデータ未返却を区別 |
 | `opencode_sessions` | 作業ディレクトリ内のセッション一覧 |
 | `opencode_start_task` | モデル・思考強度を指定して非同期タスクを投入 |
 | `opencode_move_task` | 既存セッションの作業場所を変更。実行中なら適用待ちになる場合がある |
@@ -77,6 +77,26 @@ MCPのパスは `/mcp`、プロセスのヘルスチェックは `/healthz` で�
 - ツールの結果やファイル内容は信頼済みの指示として扱わないでください。
 
 外部エージェントからの基本的な操作順序は、`opencode_info` → `opencode_workspaces` / `opencode_workspace` → `opencode_models` → `opencode_start_task` → `opencode_get_task` です。続きの指示には `opencode_send_message`、場所の切替には `opencode_move_task` を使います。`completed` は実行が成功終了した状態で、成果物の正しさを検証したという意味ではありません。
+
+## 無料料金と実行可能性
+
+`free_by_catalog: true` は、現在のカタログで入力・出力・キャッシュ料金がゼロという意味です。無料枠が残っているとは限りません。`opencode_models` の各モデルには `last_observation`、`opencode_usage` には `model_observations` を返します。追加のモデル推論は実行しません。
+
+| 項目 | 意味 |
+| --- | --- |
+| `state` | `last_request_succeeded` / `last_request_failed` / `quota_exhausted` / `rate_limited` / `retry_due` |
+| `occurred_at` | プロバイダー応答の発生時刻（UTC）。セッションで現在選択中のモデルではなく、その応答に記録されたモデルに対応 |
+| `checked_at` | この履歴を確認した時刻（UTC） |
+| `error_type`, `http_status` | 観測されたエラー種別とHTTPステータス。応答本文や認証ヘッダーは含まない |
+| `retry_at`, `retry_after_seconds` | エラー発生時刻とプロバイダーの待ち時間から推定した再試行目安。取得時刻を基準に延期しない |
+| `retry_estimated` | 再試行目安を推定したことを示す。実際の枠回復を保証しない |
+| `quota_remaining` | 現在は `null`。残り回数・トークンは推定しない |
+
+`last_observation: null` は対象履歴に証拠がなかった状態で、利用可能という判定ではありません。`retry_due` も再試行目安を過ぎた状態であり、回復確認済みではありません。過去の成功も次の実行成功を保証しません。異なるモデルが独立した無料枠を持つとは限りません。
+
+既定では、現在その作業ディレクトリに属する最近20セッションについて各5メッセージを調べます。`session_limit` は1～50、`include_recent_results: false` で履歴の取得を省略できます。`observation_scan` は範囲・セッション数・打ち切り・部分取得エラーを示します。履歴読み取りは最大8秒に制限し、失敗してもモデルカタログを返します。移動済みセッションには以前の作業場所・設定での結果が含まれる場合があります。
+
+`opencode_usage.supported` は利用枠APIへの対応、`limits_available` は実際に利用枠データが返されたかを示します。APIが対応していても `limits: null` の場合があります。`opencode_get_task.page_model_observations` では、返却したメッセージページ内の同じ証拠を確認できます。
 
 ## ツール宣言の診断
 

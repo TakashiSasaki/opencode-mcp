@@ -1,5 +1,6 @@
 """Boundary checks independent of provider inference and user files."""
 
+import asyncio
 import json
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 import httpx2
 
 import server
+from availability import message_observation, merge_observations
 
 
 class Boundaries(unittest.TestCase):
@@ -225,12 +227,12 @@ class RetryBoundaries(unittest.IsolatedAsyncioTestCase):
             {"id": "disabled", "enabled": False, "cost": [{"input": 0, "output": 0, "cache": {"read": 0, "write": 0}}]},
         ])
         with patch.object(server, "model_catalog", catalog):
-            result = await server.opencode_models(free_only=True)
+            result = await server.opencode_models(free_only=True, include_recent_results=False)
         self.assertEqual([m["id"] for m in result["models"]], ["free"])
 
     async def test_unavailable_usage_route_is_explicit(self):
         with patch.object(server, "api", AsyncMock(side_effect=server.APIError("HTTP 404", status_code=404))):
-            result = await server.opencode_usage()
+            result = await server.opencode_usage(include_recent_results=False)
         self.assertFalse(result["supported"])
         self.assertIsNone(result["limits"])
 
@@ -249,6 +251,135 @@ class RetryBoundaries(unittest.IsolatedAsyncioTestCase):
         with patch.object(server, "api", mock), self.assertRaises(ValueError):
             await server.submit_message("ses_test", "different", "request-1")
         self.assertEqual(mock.await_count, 1)
+
+
+class ModelEvidence(unittest.IsolatedAsyncioTestCase):
+    def response(self, model="free", completed=2000, error=None, finish="stop"):
+        return {"id": "msg_sample", "type": "assistant", "model": {"providerID": "provider", "id": model},
+                "time": {"created": 1000, "completed": completed}, "finish": finish, "error": error,
+                "content": [{"type": "reasoning", "text": "private reasoning"}],
+                "native": {"secret": "private native data"}}
+
+    def test_retry_time_uses_failure_time_not_poll_time_and_never_implies_balance(self):
+        error = {"type": "provider.free-limit", "status": 429, "retryAfterMs": 10000,
+                 "message": "private error text", "response": {"headers": {"Authorization": "private header"}}}
+        message = self.response(error=error, finish="error")
+        first = message_observation(message, "ses_test", 3000)
+        later = message_observation(message, "ses_test", 9000)
+        self.assertEqual(first["state"], "quota_exhausted")
+        self.assertEqual(first["retry_at"], "1970-01-01T00:00:12.000Z")
+        self.assertEqual(first["retry_at"], later["retry_at"])
+        self.assertEqual(later["retry_after_seconds"], 3)
+        self.assertIsNone(first["quota_remaining"])
+        self.assertNotIn("private", json.dumps(first))
+        expired = message_observation(message, "ses_test", 13000)
+        self.assertEqual(expired["state"], "retry_due")
+        self.assertEqual(expired["retry_after_seconds"], 0)
+        self.assertIsNone(expired["quota_remaining"])
+
+    def test_generic_rate_limit_and_absent_invalid_retry_values_remain_distinct(self):
+        for delay in (None, -1, True, "1000", float("inf")):
+            with self.subTest(delay=delay):
+                result = message_observation(self.response(error={"type": "provider.rate-limit", "status": 429,
+                                             "retryAfterMs": delay}, finish="error"), "ses_test", 3000)
+                self.assertEqual(result["state"], "rate_limited")
+                self.assertIsNone(result["retry_at"])
+
+    def test_unfinished_interrupted_unknown_and_model_less_messages_are_not_successes(self):
+        for changes in ({"finish": "unknown"}, {"finish": "error"}, {"finish": "content-filter"},
+                        {"time": {"created": 1000}}, {"model": None}, {"type": "idle"}):
+            with self.subTest(changes=changes):
+                self.assertIsNone(message_observation({**self.response(), **changes}, "ses_test", 3000))
+
+    def test_latest_response_wins_independent_of_session_or_message_order(self):
+        failed = self.response(completed=2000, error={"type": "provider.free-limit", "status": 429}, finish="error")
+        success = self.response(completed=4000)
+        other = self.response(model="other", completed=2500)
+        merged = {}
+        merge_observations(merged, [success, other], "ses_new", 5000)
+        merge_observations(merged, [failed], "ses_old", 5000)
+        self.assertEqual(merged["provider/free"]["state"], "last_request_succeeded")
+        self.assertEqual(merged["provider/free"]["session_id"], "ses_new")
+        self.assertEqual(len(merged), 2)
+
+    async def test_history_scope_boundaries_truncation_and_model_attribution(self):
+        path = server.DEFAULT_DIRECTORY
+        async def fake_api(method, route, body=None, **query):
+            if route == "/api/session":
+                self.assertEqual(query, {"directory": str(path), "limit": 3})
+                return {"data": [
+                    {"id": "ses_match", "location": {"directory": str(path)}, "model": {"providerID": "wrong", "id": "now-selected"}},
+                    {"id": "ses_outside", "location": {"directory": "/etc"}},
+                    {"id": "ses_invalid/../path", "location": {"directory": str(path)}}], "cursor": {"next": "more"}}
+            self.assertEqual(route, "/api/session/ses_match/message")
+            self.assertEqual(query, {"limit": 5, "order": "desc"})
+            return {"data": [self.response()]}
+        with patch.object(server, "api", fake_api):
+            observations, scan = await server.recent_model_observations(path, 3)
+        self.assertEqual(set(observations), {"provider/free"})
+        self.assertEqual(scan["sessions_examined"], 1)
+        self.assertTrue(scan["sessions_truncated"])
+        self.assertTrue(scan["partial"])
+
+    async def test_inaccessible_history_does_not_hide_catalog_or_claim_availability(self):
+        models = [{"providerID": "provider", "id": "free", "enabled": True,
+                   "cost": [{"input": 0, "output": 0, "cache": {"read": 0, "write": 0}}]}]
+        with patch.object(server, "model_catalog", AsyncMock(return_value=models)), \
+             patch.object(server, "api", AsyncMock(side_effect=server.APIError("private error"))):
+            result = await server.opencode_models(free_only=True)
+        self.assertEqual(result["count"], 1)
+        self.assertIsNone(result["models"][0]["last_observation"])
+        self.assertEqual(result["models"][0]["quota_available"], "unknown")
+        self.assertEqual(result["observation_scan"]["issues"], ["session_inventory_unavailable"])
+        self.assertNotIn("private", json.dumps(result))
+
+    async def test_history_timeout_cancels_reads_and_preserves_completed_evidence(self):
+        cancelled = asyncio.Event()
+        path = server.DEFAULT_DIRECTORY
+        async def fake_api(method, route, body=None, **query):
+            if route == "/api/session":
+                return {"data": [{"id": "ses_fast", "location": {"directory": str(path)}},
+                                 {"id": "ses_slow", "location": {"directory": str(path)}}]}
+            if route.endswith("ses_fast/message"):
+                return {"data": [self.response()]}
+            try:
+                await asyncio.sleep(60)
+            finally:
+                cancelled.set()
+        with patch.object(server, "api", fake_api), patch.object(server, "HISTORY_TIMEOUT_SECONDS", 0.02):
+            observations, scan = await server.recent_model_observations(path, 2)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(scan["sessions_examined"], 1)
+        self.assertTrue(scan["partial"])
+        self.assertIn("history_timeout", scan["issues"])
+        self.assertIn("provider/free", observations)
+
+    async def test_null_account_limits_are_not_reported_as_available(self):
+        with patch.object(server, "api", AsyncMock(return_value={"data": None})), \
+             patch.object(server, "recent_model_observations", AsyncMock(return_value=({}, None))) as history:
+            result = await server.opencode_usage()
+        self.assertTrue(result["supported"])
+        self.assertFalse(result["limits_available"])
+        self.assertEqual(result["free_promotional_model_quota"], "unknown")
+        history.assert_awaited_once()
+
+    async def test_catalog_only_mode_does_not_read_session_history(self):
+        with patch.object(server, "model_catalog", AsyncMock(return_value=[])), \
+             patch.object(server, "recent_model_observations", AsyncMock()) as history:
+            result = await server.opencode_models(include_recent_results=False)
+        history.assert_not_awaited()
+        self.assertIsNone(result["observation_scan"])
+
+    async def test_output_schemas_expose_evidence_and_missing_balance(self):
+        definitions = {tool.name: tool.model_dump(mode="json", by_alias=True, exclude_none=True)
+                       for tool in await server.mcp.list_tools()}
+        schema = definitions["opencode_models"]["outputSchema"]
+        self.assertIn("observation_scan", schema["properties"])
+        self.assertIn("last_observation", schema["$defs"]["ModelSummary"]["properties"])
+        observation = schema["$defs"]["ModelObservation"]["properties"]
+        self.assertEqual(observation["quota_remaining"]["type"], "null")
+        self.assertIn("retry_at", observation)
+        self.assertIn("limits_available", definitions["opencode_usage"]["outputSchema"]["properties"])
 
 
 class TransportBoundaries(unittest.IsolatedAsyncioTestCase):
