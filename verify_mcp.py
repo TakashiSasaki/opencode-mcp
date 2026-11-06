@@ -1,105 +1,125 @@
-"""Verify real stdio MCP discovery and OpenCode API access; inference is opt-in."""
+"""Verify stdio or HTTP MCP against OpenCode using an owned temporary session."""
+# Copyright (c) 2026 佐々木隆志 (Takashi Sasaki) <takashi316@gmail.com> (https://x.com/TakashiSasaki)
 
 import argparse
 import asyncio
 import json
 from pathlib import Path
+import tempfile
 import time
+import uuid
 
 from mcp import Client, StdioServerParameters
 
+import server
 
-async def main(inference: bool) -> None:
-    project = Path(__file__).resolve().parent
+
+async def verify(url: str | None, inference: bool, model: str | None = None) -> None:
+    endpoint = url or StdioServerParameters(command=str(server.PROJECT / "run.sh"))
     results = {}
-    async with Client(StdioServerParameters(command=str(project / "run.sh")), mode="legacy", raise_exceptions=True) as client:
-        tools = await client.list_tools()
-        results["tools"] = [tool.name for tool in tools.tools]
-        for name in ("opencode_info", "opencode_models", "opencode_sessions", "opencode_usage", "opencode_projects", "opencode_workspaces", "opencode_workspace"):
-            result = await client.call_tool(name, {})
-            results[name] = result.structured_content
-            print(name, "OK")
-        result = await client.call_tool("opencode_get_task", {"session_id": "ses_bad/../credential"})
-        if not result.is_error:
-            raise AssertionError("Malformed session ID must be rejected")
-        results["malformed_id_rejected"] = True
-        free = await client.call_tool("opencode_models", {"free_only": True})
-        results["free_models"] = free.structured_content
-        if not all(m["free_by_catalog"] for m in results["free_models"]["models"]):
-            raise AssertionError("Free-only filter included a non-free model")
-        # Exercise model and effort selection on a blank session, without inference charges.
-        import server
-        session_id = "ses_mcp_settings_verification"
-        try:
-            await server.checked_session(session_id)
-        except server.APIError as exc:
-            if exc.tag != "SessionNotFoundError":
-                raise
-            await server.api("post", "/api/session", {"id": session_id, "title": "MCP model/effort verification (no inference)",
-                "location": {"directory": str(server.DEFAULT_DIRECTORY)},
-                "model": {"providerID": "opencode", "id": "beam-free", "variant": "low"}})
-        changed = await client.call_tool("opencode_set_model", {"session_id": session_id, "model": "opencode/beam-free", "reasoning_effort": "high"})
-        actual = await server.checked_session(session_id)
-        if actual["model"].get("variant") != "high":
-            raise AssertionError("OpenCode did not retain the requested reasoning variant")
-        results["model_effort_verified"] = changed.structured_content
-        unsupported = await client.call_tool("opencode_set_model", {"session_id": session_id, "model": "opencode/big-pickle", "reasoning_effort": "high"})
-        if not unsupported.is_error:
-            raise AssertionError("Unsupported reasoning effort must be rejected")
-        results["unsupported_effort_rejected"] = True
-        # Change only our blank verification session's context, then restore it. No model prompt is sent.
-        original_directory = actual["location"]["directory"]
-        try:
-            changed = await client.call_tool("opencode_move_task", {"session_id": session_id, "directory_path": str(Path.home())})
-            for _ in range(10):
-                actual = await server.checked_session(session_id)
-                if actual["location"]["directory"] == str(Path.home()):
-                    break
-                await asyncio.sleep(0.2)
-            else:
-                raise AssertionError("Workspace move did not apply to idle verification session")
-            inspected = await client.call_tool("opencode_workspace", {"directory_path": str(Path.home())})
-            if inspected.structured_content["location"]["directory"] != str(Path.home()):
-                raise AssertionError("Explicit workspace inspection resolved the wrong location")
-            results["workspace_move_verified"] = changed.structured_content
-        finally:
-            await client.call_tool("opencode_move_task", {"session_id": session_id, "directory_path": original_directory})
-        print("workspace selection and move", "OK")
+    async with Client(endpoint, mode="legacy", raise_exceptions=True) as client:
+        async def call(name, arguments=None):
+            result = await client.call_tool(name, arguments or {})
+            if result.is_error:
+                raise AssertionError(f"{name} failed: {result.content}")
+            return result.structured_content
+
+        catalog = await client.list_tools()
+        definitions = [t.model_dump(mode="json", by_alias=True, exclude_none=True) for t in catalog.tools]
+        info = await call("opencode_info", {"tool": "opencode_start_task", "include_instructions": True})
+        assert info["tool_names"] == sorted(t["name"] for t in definitions)
+        assert json.loads(info["contract"]["tool_json"]) == next(t for t in definitions if t["name"] == "opencode_start_task")
+        assert info["transport"] == ("streamable-http" if url else "stdio")
+        results["info"] = info
+        for name in ("opencode_projects", "opencode_workspaces", "opencode_workspace", "opencode_sessions", "opencode_usage"):
+            results[name] = await call(name)
+            print(name, "OK", flush=True)
+        invalid = await client.call_tool("opencode_get_task", {"session_id": "ses_bad/../credential"})
+        assert invalid.is_error
+        free = await call("opencode_models", {"free_only": True})
+        assert all(m["free_by_catalog"] is True for m in free["models"])
+        results["free_models"] = free
+        default = next(m for m in free["models"] if m["model"] == info["default_model"])
+        with tempfile.TemporaryDirectory(prefix="mcp-verification-", dir=info["default_directory"]) as temporary:
+            first, second = Path(temporary)/"first", Path(temporary)/"second"
+            first.mkdir()
+            second.mkdir()
+            session_id = "ses_mcp_verify_" + uuid.uuid4().hex
+            await server.api("post", "/api/session", {"id": session_id, "title": "Owned MCP workspace verification",
+                "location": {"directory": str(first)}, "model": {"providerID": default["providerID"], "id": default["id"]}})
+            try:
+                before = await call("opencode_get_task", {"session_id": session_id})
+                assert before["status"] == "idle"
+                assert before["session"]["location"]["directory"] == str(first)
+                results["move"] = await call("opencode_move_task", {"session_id": session_id, "directory_path": str(second)})
+                after = await call("opencode_get_task", {"session_id": session_id})
+                assert after["session"]["location"]["directory"] == str(second)
+                assert results["move"]["applied"]
+                assert (await call("opencode_info"))["default_directory"] == info["default_directory"]
+                resolved = await call("opencode_workspace", {"directory_path": str(second)})
+                assert resolved["location"]["directory"] == str(second)
+                variant_model = next((m for m in free["models"] if m["reasoning_efforts"]), None)
+                if variant_model:
+                    variant = variant_model["reasoning_efforts"][0]
+                    results["model_selection"] = await call("opencode_set_model", {"session_id": session_id,
+                        "model": variant_model["model"], "reasoning_effort": variant})
+                    actual = await server.checked_session(session_id)
+                    assert actual["model"]["variant"] == variant
+                    invalid = await client.call_tool("opencode_set_model", {"session_id": session_id,
+                        "model": variant_model["model"], "reasoning_effort": "unsupported-verification-value"})
+                    assert invalid.is_error
+                restored = await call("opencode_move_task", {"session_id": session_id, "directory_path": str(first)})
+                assert restored["applied"]
+                print("owned session workspace/model changes OK", flush=True)
+            finally:
+                # This fresh, uniquely named session never received a model prompt.
+                await server.api("delete", f"/api/session/{session_id}")
+
         if inference:
-            request = {"prompt": "接続確認です。ファイル操作やツール実行はせず、『OpenCode MCP 接続成功』とだけ答えてください。",
-                       "request_id": "setup-smoke-2026-10-27-v1", "title": "MCP connection verification"}
-            started = await client.call_tool("opencode_start_task", request)
-            results["started"] = started.structured_content
-            session_id = results["started"]["session_id"]
-            repeated = await client.call_tool("opencode_start_task", request)
-            if not repeated.structured_content.get("reused"):
-                raise AssertionError("Task retry must reuse the existing message")
-            results["retry_reused"] = True
-            deadline = time.monotonic() + 40
+            selected = model or info["default_model"]
+            assert any(m["model"] == selected for m in free["models"]), "Inference verification requires a current zero-catalog-price model"
+            request = {"prompt": "Connection test: do not use tools or change files. Reply with exactly OPENCODE_MCP_56.",
+                       "request_id": "mcp-smoke-" + uuid.uuid4().hex, "directory_path": info["default_directory"],
+                       "title": "MCP execution verification"}
+            if model:
+                request["model"] = model
+            started = await call("opencode_start_task", request)
+            session_id = started["session_id"]
+            results["started"] = started
+            repeated = await call("opencode_start_task", request)
+            assert repeated["reused"] and repeated["session_id"] == session_id
+            deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
-                result = await client.call_tool("opencode_get_task", {"session_id": session_id})
-                status = result.structured_content
-                if status["status"] in {"completed", "failed", "interrupted", "waiting_for_approval", "waiting_for_input"}:
-                    results["task"] = status
+                task = await call("opencode_get_task", {"session_id": session_id})
+                if task["status"] in {"completed", "failed", "interrupted", "waiting_for_approval", "waiting_for_input"}:
+                    results["task"] = task
                     break
                 await asyncio.sleep(1)
             else:
-                raise AssertionError("Task did not complete within 40 seconds")
-            if results["task"]["status"] == "failed":
-                errors = [m.get("error", {}) for m in results["task"]["messages"] if m.get("error")]
-                if not any(e.get("type") == "provider.free-limit" for e in errors):
-                    raise AssertionError(f"Unexpected task failure: {errors}")
-                results["inference"] = "blocked_by_provider_free_limit"
-            elif results["task"]["status"] != "completed":
-                raise AssertionError(f"Unexpected task status: {results['task']['status']}")
-            else:
+                await call("opencode_interrupt_task", {"session_id": session_id})
+                raise AssertionError(f"Task {session_id} did not settle within 60 seconds; interrupt requested")
+            if task["status"] == "failed":
+                errors = [m.get("error", {}) for m in task["messages"] if m.get("error")]
+                results["inference"] = "provider_failure"
+                results["provider_errors"] = errors
+            elif task["status"] == "completed":
+                assert any("OPENCODE_MCP_56" in m.get("text", "") for m in task["messages"] if m.get("type") == "assistant")
                 results["inference"] = "completed"
-            print("inference", results["inference"], "recorded_cost_usd", results["task"]["session"]["cost"])
-    (project / "verification.json").write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n")
-    print("MCP verification passed;", len(results["tools"]), "tools")
+            else:
+                results["inference"] = task["status"]
+            print("inference", results["inference"], flush=True)
+    (server.PROJECT / "verification.json").write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n")
+    print("MCP transport and workspace verification passed", flush=True)
+    if inference and results.get("inference") != "completed":
+        raise SystemExit("Model inference did not complete successfully; see verification.json for the task status and provider errors")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--inference", action="store_true", help="Send one greeting to the configured default model after verifying zero catalog prices")
-    asyncio.run(main(parser.parse_args().inference))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", help="HTTP MCP endpoint; omit to launch the stdio server")
+    parser.add_argument("--inference", action="store_true", help="Opt into one small prompt on the current zero-catalog-price default model")
+    parser.add_argument("--model", help="Explicit zero-catalog-price model for --inference; never changes the server default")
+    args = parser.parse_args()
+    if args.model and not args.inference:
+        parser.error("--model requires --inference")
+    asyncio.run(verify(args.url, args.inference, args.model))

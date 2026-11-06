@@ -1,9 +1,12 @@
 """Boundary checks independent of provider inference and user files."""
 
+import json
 import unittest
 from pathlib import Path
 import tempfile
 from unittest.mock import AsyncMock, patch
+
+import httpx2
 
 import server
 
@@ -193,6 +196,18 @@ class WorkspaceBoundaries(unittest.IsolatedAsyncioTestCase):
 
 
 class RetryBoundaries(unittest.IsolatedAsyncioTestCase):
+    async def test_task_retry_reports_current_workspace_after_move(self):
+        requested = server.DEFAULT_DIRECTORY
+        moved = server.PROJECT
+        prompt, key, title = "continue", "workspace-retry", "workspace test"
+        payload = server.request_hash([prompt, str(requested), title, server.DEFAULT_MODEL])
+        prior = {"metadata": {"opencode_mcp": {"payload_hash": payload}}, "location": {"directory": str(moved)}}
+        submit = AsyncMock(return_value={"reused": True})
+        with patch.object(server, "api", AsyncMock(return_value={"data": prior})), patch.object(server, "submit_message", submit):
+            result = await server.opencode_start_task(prompt, key, str(requested), title)
+        self.assertEqual(result["directory"], str(moved))
+        self.assertEqual(result["requested_directory"], str(requested))
+
     async def test_effort_maps_to_variant_and_unsupported_effort_fails(self):
         catalog = AsyncMock(return_value=[{"providerID": "opencode", "id": "beam-free", "enabled": True,
                                            "variants": [{"id": "high"}], "cost": [{"input": 0, "output": 0, "cache": {"read": 0, "write": 0}}]}])
@@ -234,6 +249,61 @@ class RetryBoundaries(unittest.IsolatedAsyncioTestCase):
         with patch.object(server, "api", mock), self.assertRaises(ValueError):
             await server.submit_message("ses_test", "different", "request-1")
         self.assertEqual(mock.await_count, 1)
+
+
+class TransportBoundaries(unittest.IsolatedAsyncioTestCase):
+    async def test_native_contract_matches_catalog_and_omits_unrequested_bodies(self):
+        with patch.object(server, "api", AsyncMock(return_value={"version": "test-backend"})) as api:
+            info = await server.opencode_info()
+            self.assertIsNone(info.contract)
+            self.assertEqual(info.transport, "stdio")
+            self.assertIsNone(info.http_path)
+            self.assertFalse(info.read_only_enforced)
+            self.assertTrue(info.hostname)
+            definitions = [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in await server.mcp.list_tools()]
+            for definition in definitions:
+                for name, field in definition["inputSchema"].get("properties", {}).items():
+                    with self.subTest(tool=definition["name"], parameter=name):
+                        self.assertTrue(field.get("description"))
+            self.assertEqual(info.tool_names, sorted(item["name"] for item in definitions))
+            self.assertEqual(info.tool_count, len(definitions))
+            requested = await server.opencode_info("opencode_start_task", True)
+            self.assertEqual(json.loads(requested.contract.tool_json), next(item for item in definitions if item["name"] == "opencode_start_task"))
+            self.assertEqual(requested.contract.instructions, server.SERVER_INSTRUCTIONS)
+            self.assertEqual(info.catalog_sha256, server.request_hash(sorted(definitions, key=lambda item: item["name"])))
+            api.reset_mock()
+            with self.assertRaises(server.InputError):
+                await server.opencode_info("../../credentials")
+            api.assert_not_awaited()
+
+    async def test_http_discovery_and_proxy_host_origin_validation(self):
+        app = server.http_app(["mcp.example.test"], ["https://mcp.example.test"])
+        headers = {"Accept": "application/json, text/event-stream"}
+        initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}
+        with patch.object(server, "TRANSPORT", "streamable-http"), patch.object(server, "api", AsyncMock(return_value={"version": "test-backend"})):
+            async with app.router.lifespan_context(app), httpx2.AsyncClient(transport=httpx2.ASGITransport(app), base_url="http://127.0.0.1:8791", headers=headers) as client:
+                health = await client.get("/healthz")
+                self.assertEqual(health.status_code, 200)
+                self.assertFalse(health.json()["backend_checked"])
+                init = await client.post("/mcp", json=initialize)
+                self.assertEqual(init.status_code, 200, init.text)
+                self.assertEqual(init.json()["result"]["serverInfo"]["version"], server.VERSION)
+                catalog = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                names = sorted(item["name"] for item in catalog.json()["result"]["tools"])
+                call = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "opencode_info", "arguments": {}}}
+                response = await client.post("/mcp", json=call)
+                result = response.json()["result"]
+                self.assertFalse(result.get("isError", False))
+                info = result["structuredContent"]
+                self.assertEqual(info["tool_names"], names)
+                self.assertEqual(info["transport"], "streamable-http")
+                self.assertEqual(info["http_path"], "/mcp")
+                proxy = {"Host": "mcp.example.test", "Origin": "https://mcp.example.test"}
+                self.assertEqual((await client.post("/mcp", json=call, headers=proxy)).status_code, 200)
+                self.assertEqual((await client.post("/mcp", json=call, headers={"Host": "untrusted.test"})).status_code, 421)
+                self.assertEqual((await client.post("/mcp", json=call, headers={"Origin": "https://untrusted.test"})).status_code, 403)
+                self.assertNotIn("mcp-session-id", init.headers)
 
 
 if __name__ == "__main__":
