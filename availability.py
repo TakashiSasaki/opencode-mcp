@@ -28,7 +28,8 @@ class ObservationScan(TypedDict):
     directory: str
     session_limit: int
     sessions_examined: int
-    sessions_truncated: bool
+    continuation_available: bool
+    session_limit_reached: bool
     messages_per_session: int
     partial: bool
     issues: list[str]

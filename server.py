@@ -226,7 +226,8 @@ async def recent_model_observations(path: Path, session_limit: int) -> tuple[dic
     observations: dict[str, ModelObservation] = {}
     scan: ObservationScan = {"checked_at": iso_time(now_ms), "source": "recent_session_messages",
                             "directory": str(path), "session_limit": session_limit, "sessions_examined": 0,
-                            "sessions_truncated": False, "messages_per_session": 5, "partial": False, "issues": []}
+                            "continuation_available": False, "session_limit_reached": False,
+                            "messages_per_session": 5, "partial": False, "issues": []}
 
     def issue(code: str) -> None:
         scan["partial"] = True
@@ -252,7 +253,10 @@ async def recent_model_observations(path: Path, session_limit: int) -> tuple[dic
         # A slow history route must not prevent callers from reading the model catalog.
         async with asyncio.timeout(HISTORY_TIMEOUT_SECONDS):
             response = await api("get", "/api/session", directory=str(path), limit=session_limit)
-            scan["sessions_truncated"] = bool((response.get("cursor") or {}).get("next"))
+            # OpenCode also returns a next cursor at the end of an inventory.
+            # A cursor alone is not evidence that additional sessions exist.
+            scan["continuation_available"] = bool((response.get("cursor") or {}).get("next"))
+            scan["session_limit_reached"] = len(response["data"]) >= session_limit
             await asyncio.gather(*(inspect_session(info) for info in response["data"][:session_limit]))
     except TimeoutError:
         issue("history_timeout")

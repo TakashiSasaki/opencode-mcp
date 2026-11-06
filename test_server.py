@@ -318,8 +318,17 @@ class ModelEvidence(unittest.IsolatedAsyncioTestCase):
             observations, scan = await server.recent_model_observations(path, 3)
         self.assertEqual(set(observations), {"provider/free"})
         self.assertEqual(scan["sessions_examined"], 1)
-        self.assertTrue(scan["sessions_truncated"])
+        self.assertTrue(scan["continuation_available"])
+        self.assertTrue(scan["session_limit_reached"])
         self.assertTrue(scan["partial"])
+
+    async def test_end_cursor_does_not_mean_the_session_limit_was_reached(self):
+        with patch.object(server, "api", AsyncMock(return_value={"data": [], "cursor": {"next": "continuation"}})):
+            observations, scan = await server.recent_model_observations(server.DEFAULT_DIRECTORY, 20)
+        self.assertEqual(observations, {})
+        self.assertTrue(scan["continuation_available"])
+        self.assertFalse(scan["session_limit_reached"])
+        self.assertFalse(scan["partial"])
 
     async def test_inaccessible_history_does_not_hide_catalog_or_claim_availability(self):
         models = [{"providerID": "provider", "id": "free", "enabled": True,
